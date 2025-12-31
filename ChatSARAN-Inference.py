@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 
 """
-ChatSARAN-Inference.py
-alpha 0.0.2
+ChatSARAN-Inference.py — complete inference script matching Train
 
-Inference script matching the training script variant with residual scaling.
-Residual scaling applied in the forward (x = x + 0.1 * attn_out).
+Features:
+ - Loads tokenizer saved by Train (chat_saran_tokenizer)
+ - Loads checkpoint saved by Train (chat_saran_ckpt.pt)
+ - Reconstructs strict single-block SARAN (explicit Steps 1..15).
+ - Residual scaling honored from checkpoint (residual_scale in saved dict).
+ - Simple interactive loop for chatting (greedy or sampled decoding).
+Usage:
+  python ChatSARAN-Inference.py
 """
 
 import math
@@ -16,34 +21,30 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoTokenizer
 
-# --------------------------- HYPERPARAMS (EDIT AT TOP) ---------------------------
-TEMPERATURE = 0.20   # set to 0.0 for greedy deterministic decoding
-TOP_K = 40
-MAX_NEW_TOKENS = 128
-# --------------------------------------------------------------------------
-
-CKPT_PATH = "chat_saran_ckpt.pt"
-TOKENIZER_DIR = "chat_saran_tokenizer"
+# --------------------------- Hyperparams (edit if desired) ---------------------
+TEMPERATURE = float(os.getenv("TEMPERATURE", 0.20))
+TOP_K = int(os.getenv("TOP_K", 40))
+MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", 128))
+CKPT_PATH = os.getenv("CKPT_PATH", "chat_saran_ckpt.pt")
+TOKENIZER_DIR = os.getenv("TOKENIZER_DIR", "chat_saran_tokenizer")
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else
                       "mps" if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()
                       else "cpu")
+# ------------------------------------------------------------------------------
 
 if not os.path.isfile(CKPT_PATH):
     sys.exit(f"Checkpoint not found: {CKPT_PATH}")
 if not os.path.isdir(TOKENIZER_DIR):
     sys.exit(f"Tokenizer directory not found: {TOKENIZER_DIR}")
 
-# load tokenizer (local only) and mirror train's model_max_length setting
 tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_DIR, local_files_only=True)
-tokenizer.model_max_length = 10**6  # mirror train to avoid warnings when encoding then chunking
+# mirror train behavior: allow long encodes (we chunk before feeding model)
+tokenizer.model_max_length = 10**6
 eos = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else tokenizer.encode("", add_special_tokens=False)[0]
 
+# --------------------------- Model matching Train --------------------------------
 class ChatSARAN(nn.Module):
-    """
-    Inference ChatSARAN with residual scaling (no LayerNorm).
-    Steps mapping remains consistent with the training file (1..15, residual at 11.5).
-    """
-    def __init__(self, vocab_size, d_model=384, block_size=256, residual_scale: float = 0.1):
+    def __init__(self, vocab_size, d_model=384, block_size=256, residual_scale=0.1):
         super().__init__()
         self.vocab_size = vocab_size
         self.d_model = d_model
@@ -58,7 +59,7 @@ class ChatSARAN(nn.Module):
         self.Wq = nn.Linear(d_model, d_model, bias=False)
         self.Wk = nn.Linear(d_model, d_model, bias=False)
         self.Wv = nn.Linear(d_model, d_model, bias=False)
-        # Step 8: scaling constant (buffer)
+        # Step 8: scaling constant
         self.register_buffer("scale", torch.tensor(1.0 / math.sqrt(d_model), dtype=torch.float32))
         # Step 9: causal mask
         self.register_buffer("mask", torch.tril(torch.ones(block_size, block_size, dtype=torch.bool)))
@@ -75,23 +76,28 @@ class ChatSARAN(nn.Module):
         x = tok + pos                                               # (B, T, d)
 
         # Steps 5-7
-        q = self.Wq(x); k = self.Wk(x); v = self.Wv(x)              # each (B, T, d)
+        q = self.Wq(x); k = self.Wk(x); v = self.Wv(x)
 
         # Step 8
-        scores = (q @ k.transpose(-2, -1)) * self.scale             # (B, T, T)
+        scores = (q @ k.transpose(-2, -1)) * self.scale
+
         # Step 9
         m = self.mask[:T, :T].to(scores.device)
         scores = scores.masked_fill(~m, float("-inf"))
-        # Step 10
-        attn = F.softmax(scores, dim=-1)                            # (B, T, T)
-        # Step 11
-        attn_out = attn @ v                                          # (B, T, d)
 
-        # Step 11.5: residual scaling (no LayerNorm)
+        # Step 10
+        attn = F.softmax(scores, dim=-1)
+
+        # Step 11
+        attn_out = attn @ v
+
+        # Step 11.5: scaled residual
         x = x + self.residual_scale * attn_out
 
-        # Steps 12-15
+        # Step 12
         last = x[:, -1, :]
+
+        # Steps 13-15
         if use_last_token:
             return self.Wout(last)
         return self.Wout(x)
@@ -108,36 +114,33 @@ class ChatSARAN(nn.Module):
             if temperature is not None and float(temperature) <= 0.0:
                 nxt = torch.argmax(logits, dim=-1, keepdim=True)
             else:
-                temp = float(temperature) if temperature is not None else 1.0
-                logits = logits / temp
+                logits_proc = logits / (temperature if temperature is not None else 1.0)
                 if top_k is not None:
-                    k = min(top_k, logits.size(-1))
-                    v, _ = torch.topk(logits, k)
+                    k = min(top_k, logits_proc.size(-1))
+                    v, _ = torch.topk(logits_proc, k)
                     cutoff = v[:, -1].unsqueeze(1)
-                    logits = torch.where(logits < cutoff, torch.full_like(logits, float("-1e10")), logits)
-                probs = F.softmax(logits, dim=-1)
+                    logits_proc = torch.where(logits_proc < cutoff, torch.full_like(logits_proc, float("-1e10")), logits_proc)
+                probs = F.softmax(logits_proc, dim=-1)
                 nxt = torch.multinomial(probs, num_samples=1)
             idx = torch.cat([idx.to(next(self.parameters()).device), nxt], dim=1)
         return idx
 
-# --------------------------- Load checkpoint and model ---------------------------
+# --------------------------- Load checkpoint & run interactive loop ----------------
 ckpt = torch.load(CKPT_PATH, map_location=DEVICE)
 if tokenizer.vocab_size != ckpt.get("vocab_size"):
     sys.exit(f"Tokenizer vocab_size ({tokenizer.vocab_size}) != checkpoint vocab_size ({ckpt.get('vocab_size')}). "
-             "Please use the tokenizer saved during training (chat_saran_tokenizer/).")
+             "Use the tokenizer saved during training (chat_saran_tokenizer/).")
 
-rs = ckpt.get("residual_scale", 0.1)
-model = ChatSARAN(ckpt["vocab_size"], ckpt["d_model"], ckpt["block_size"], residual_scale=rs).to(DEVICE)
+model = ChatSARAN(ckpt["vocab_size"], ckpt["d_model"], ckpt["block_size"], residual_scale=ckpt.get("residual_scale", 0.1)).to(DEVICE)
 model.load_state_dict(ckpt["state_dict"])
 model.eval()
 print("Loaded ChatSARAN model. Ready to chat. (Ctrl-C to exit)")
 
 def clean_decode(token_ids):
     txt = tokenizer.decode(token_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-    txt = " ".join(txt.split())
-    return txt.strip()
+    return " ".join(txt.split()).strip()
 
-SYSTEM_PROMPT = "System: You are SARAN, a helpful, concise, and polite assistant. "
+SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", "System: You are SARAN, a helpful, concise assistant. ")
 
 try:
     while True:
