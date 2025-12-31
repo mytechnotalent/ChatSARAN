@@ -2,8 +2,12 @@
 
 """
 ChatSARAN-Inference.py
-alpha 0.01
+alpha 0.0.2
+
+Inference script matching the training script variant with residual scaling.
+Residual scaling applied in the forward (x = x + 0.1 * attn_out).
 """
+
 import math
 import os
 import sys
@@ -36,14 +40,15 @@ eos = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else tokenize
 
 class ChatSARAN(nn.Module):
     """
-    Inference ChatSARAN with minimal residual and no LayerNorm.
+    Inference ChatSARAN with residual scaling (no LayerNorm).
     Steps mapping remains consistent with the training file (1..15, residual at 11.5).
     """
-    def __init__(self, vocab_size, d_model=384, block_size=256):
+    def __init__(self, vocab_size, d_model=384, block_size=256, residual_scale: float = 0.1):
         super().__init__()
         self.vocab_size = vocab_size
         self.d_model = d_model
         self.block_size = block_size
+        self.residual_scale = float(residual_scale)
 
         # Step 1: token embeddings
         self.tok_emb = nn.Embedding(vocab_size, d_model)
@@ -82,8 +87,8 @@ class ChatSARAN(nn.Module):
         # Step 11
         attn_out = attn @ v                                          # (B, T, d)
 
-        # Step 11.5: residual (no LayerNorm)
-        x = x + attn_out
+        # Step 11.5: residual scaling (no LayerNorm)
+        x = x + self.residual_scale * attn_out
 
         # Steps 12-15
         last = x[:, -1, :]
@@ -121,7 +126,8 @@ if tokenizer.vocab_size != ckpt.get("vocab_size"):
     sys.exit(f"Tokenizer vocab_size ({tokenizer.vocab_size}) != checkpoint vocab_size ({ckpt.get('vocab_size')}). "
              "Please use the tokenizer saved during training (chat_saran_tokenizer/).")
 
-model = ChatSARAN(ckpt["vocab_size"], ckpt["d_model"], ckpt["block_size"]).to(DEVICE)
+rs = ckpt.get("residual_scale", 0.1)
+model = ChatSARAN(ckpt["vocab_size"], ckpt["d_model"], ckpt["block_size"], residual_scale=rs).to(DEVICE)
 model.load_state_dict(ckpt["state_dict"])
 model.eval()
 print("Loaded ChatSARAN model. Ready to chat. (Ctrl-C to exit)")
