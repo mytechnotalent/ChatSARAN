@@ -2,16 +2,16 @@
 
 """
 ChatSARAN-Train.py
-alpha 0.01
+alpha 0.0.2
 
-Training script for ChatSARAN (single-block SARAN)
-
-Other safe defaults retained:
- - chunked tokenization to BLOCK_SIZE to avoid long-sequence warnings
- - MAX_TOKENS default = 10_000_000
- - conservative model/batch defaults for single-machine training (D_MODEL=384)
- - data_ids.pt rebuilt if missing or smaller than MAX_TOKENS
+Single-block SARAN training (no LayerNorm) with:
+ - residual scaling: x = x + 0.1 * attn_out
+ - warmup increased to 5% of total steps
+ - weight_decay set to 0.0 during initial experiments
+ - chunked tokenization, rebuild data_ids.pt if needed
+ - conservative model/batch defaults for single-machine training
 """
+
 import math
 import os
 import time
@@ -165,18 +165,19 @@ train_data = data[:n_train]    # CPU tensor
 val_data = data[n_train:]      # CPU tensor
 print(f"Train tokens: {len(train_data)} | Val tokens: {len(val_data)}")
 
-# --------------------------- ChatSARAN model (STRICT SARAN steps with residual, no LayerNorm) ---------------------------
+# --------------------------- ChatSARAN model (STRICT SARAN steps with residual scaling) ---------------------------
 class ChatSARAN(nn.Module):
     """
-    Single-block masked self-attention with a minimal residual (x = x + attn_out).
-    LayerNorm has been removed to match the requested strict SARAN variant.
-    Step ordering (1..15) preserved; residual is applied as step 11.5.
+    Single-block masked self-attention with a small residual scaling factor.
+    Residual scaling applied: x = x + 0.1 * attn_out (step 11.5).
+    LayerNorm intentionally removed to keep strict SARAN.
     """
-    def __init__(self, vocab_size: int, d_model: int = D_MODEL, block_size: int = BLOCK_SIZE):
+    def __init__(self, vocab_size: int, d_model: int = D_MODEL, block_size: int = BLOCK_SIZE, residual_scale: float = 0.1):
         super().__init__()
         self.vocab_size = vocab_size
         self.d_model = d_model
         self.block_size = block_size
+        self.residual_scale = float(residual_scale)
 
         # Step 1: token embeddings
         self.tok_emb = nn.Embedding(vocab_size, d_model)
@@ -217,8 +218,8 @@ class ChatSARAN(nn.Module):
         # Step 11
         attn_out = attn @ v                                           # (B, T, d)
 
-        # Step 11.5: residual (no LayerNorm)
-        x = x + attn_out
+        # Step 11.5: residual scaling (keeps SARAN ordering)
+        x = x + self.residual_scale * attn_out
 
         # Step 12
         last = x[:, -1, :]                                            # (B, d)
@@ -261,12 +262,14 @@ class ChatSARAN(nn.Module):
             "vocab_size": self.vocab_size,
             "d_model": self.d_model,
             "block_size": self.block_size,
+            "residual_scale": self.residual_scale,
         }, path)
 
     @classmethod
     def load(cls, path: str, map_location=None):
         ckpt = torch.load(path, map_location=map_location or DEVICE)
-        model = cls(ckpt["vocab_size"], ckpt["d_model"], ckpt["block_size"])
+        rs = ckpt.get("residual_scale", 0.1)
+        model = cls(ckpt["vocab_size"], ckpt["d_model"], ckpt["block_size"], residual_scale=rs)
         model.load_state_dict(ckpt["state_dict"])
         return model
 
@@ -281,7 +284,7 @@ def get_batch_from_concat(data_tensor: torch.LongTensor, block_size: int = BLOCK
     return x.to(device), y.to(device)
 
 # --------------------------- Instantiate + optimizer + scheduler ---------------------------
-model = ChatSARAN(vocab_size=vocab_size, d_model=D_MODEL, block_size=BLOCK_SIZE).to(DEVICE)
+model = ChatSARAN(vocab_size=vocab_size, d_model=D_MODEL, block_size=BLOCK_SIZE, residual_scale=0.1).to(DEVICE)
 
 # try torch.compile to speed up if available
 if USE_TORCH_COMPILE:
@@ -291,9 +294,11 @@ if USE_TORCH_COMPILE:
     except Exception as e:
         print("torch.compile not enabled:", e)
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-2)
+# weight_decay set to 0.0 for early experiments (can re-enable later)
+optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=0.0)
 total_steps = EPOCHS * STEPS_PER_EPOCH
-warmup_steps = max(1, int(0.03 * total_steps))
+# warmup increased to 5% of total_steps for stability without LayerNorm
+warmup_steps = max(1, int(0.05 * total_steps))
 scheduler = get_linear_schedule_with_warmup(optimizer, warmup_steps, total_steps)
 
 # --------------------------- Training loop with validation (grad accumulation) ---------------------------
