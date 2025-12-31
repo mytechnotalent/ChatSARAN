@@ -10,6 +10,7 @@ Single-block SARAN training (no LayerNorm) with:
  - weight_decay set to 0.0 during initial experiments
  - chunked tokenization, rebuild data_ids.pt if needed
  - conservative model/batch defaults for single-machine training
+ - NOTE: STEPS_PER_EPOCH and LR adjusted per request
 """
 
 import math
@@ -31,10 +32,12 @@ D_MODEL = 384             # model dimensionality (reduced for single-machine)
 BATCH_SIZE = 32           # physical batch per step
 GRAD_ACCUM_STEPS = 4      # accumulate 4 steps -> effective batch 128
 
-# compute steps_per_epoch so an epoch ≈ MAX_TOKENS tokens seen
-STEPS_PER_EPOCH = max(1, int(MAX_TOKENS // (BATCH_SIZE * BLOCK_SIZE)))
+# NOTE: overridden per user's request for quick experiments
+STEPS_PER_EPOCH = 200     # use fixed short epoch for experiments (was computed from MAX_TOKENS)
 EPOCHS = 10_000           # long budget; early stopping used below
-LR = 5e-5                 # learning rate
+
+# Learning rate updated per request
+LR = 2e-4                 # learning rate (was 5e-5)
 VAL_SPLIT = 0.05
 
 # early stopping
@@ -307,6 +310,9 @@ epochs_no_improve = 0
 
 print("Beginning training...")
 for ep in range(1, EPOCHS + 1):
+    # print current LR for debugging
+    for pg in optimizer.param_groups:
+        print(f"Epoch {ep} starting LR: {pg['lr']:.6g}")
     model.train()
     running = 0.0
     pbar = trange(STEPS_PER_EPOCH, desc=f"Epoch {ep}/{EPOCHS}")
