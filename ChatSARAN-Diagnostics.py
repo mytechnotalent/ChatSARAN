@@ -10,14 +10,16 @@ Run this in the same environment as your training output to print:
  - model parameter count
 
 Usage:
-  python ChatSARAN-diagnostics.py
+  python ChatSARAN-Diagnostics.py
 """
 
-import torch
-import torch.nn.functional as F
-from transformers import AutoTokenizer
+import math
 import os
 import sys
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from transformers import AutoTokenizer
 
 # adjust paths if needed
 DATA_IDS = "data_ids.pt"
@@ -43,8 +45,6 @@ tokenizer.model_max_length = 10**6
 eos = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else tokenizer.encode("", add_special_tokens=False)[0]
 
 # Recreate the single-block ChatSARAN (matches inference/training - residual scaling included)
-import math, torch.nn as nn
-
 class ChatSARAN(nn.Module):
     def __init__(self, vocab_size, d_model=384, block_size=256, residual_scale=0.1):
         super().__init__()
@@ -78,6 +78,32 @@ class ChatSARAN(nn.Module):
         if use_last_token:
             return self.Wout(last)
         return self.Wout(x)
+
+    @torch.no_grad()
+    def generate(self, idx: torch.LongTensor, max_new_tokens: int = 64, temperature: float = None, top_k: int = None):
+        """
+        Simple generation loop (greedy or sampled depending on temperature/top_k).
+        """
+        temperature = 1.0 if temperature is None else float(temperature)
+        for _ in range(max_new_tokens):
+            idx_cond = idx[:, -self.block_size:].to(next(self.parameters()).device)
+            logits = self(idx_cond, use_last_token=True)  # (B, V)
+
+            # greedy
+            if temperature is not None and float(temperature) <= 0.0:
+                nxt = torch.argmax(logits, dim=-1, keepdim=True)
+            else:
+                logits_proc = logits / temperature if temperature is not None else logits
+                if top_k is not None:
+                    k = min(top_k, logits_proc.size(-1))
+                    v, _ = torch.topk(logits_proc, k)
+                    cutoff = v[:, -1].unsqueeze(1)
+                    logits_proc = torch.where(logits_proc < cutoff, torch.full_like(logits_proc, float("-1e10")), logits_proc)
+                probs = F.softmax(logits_proc, dim=-1)
+                nxt = torch.multinomial(probs, num_samples=1)
+
+            idx = torch.cat([idx.to(next(self.parameters()).device), nxt], dim=1)
+        return idx
 
 # load checkpoint
 ckpt = torch.load(CKPT_PATH, map_location=DEVICE)
