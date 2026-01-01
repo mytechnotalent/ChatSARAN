@@ -2,4 +2,5 @@ This is a brand-new testing implemenation of https://github.com/mytechnotalent/S
 Right now we are experimenting with an augmented SARAN called SARANS which adds an MLP synthesis ...
 
 Shallow Auto-Regressive Attention Network with Synthesis
+
 new step "MLP Feature Synthesis." This highlights that the network now possesses the ability to synthesize features after attending to them, distinguishing it from the "pure" routing mechanism of the original SARAN.
