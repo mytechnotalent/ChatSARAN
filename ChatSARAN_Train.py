@@ -1,29 +1,35 @@
 #!/usr/bin/env python3
 """
-ChatSARAN_MLP_Train_v2.py
+ChatSARAN_Train.py
+==================
 
-SARAN + Minimal MLP Extension (STRICT)
-=====================================
+STRICT SARAN + MINIMAL MLP (ARCHITECTURE PRESERVED)
 
-This file implements SARAN EXACTLY as defined with ONE nonlinear MLP.
-No recurrence. No stacking. Single-head attention.
+This implementation follows the SARAN paper EXACTLY with a single,
+non-stacked attention pass and a minimal MLP enhancement.
 
-15-Step Flow (STRICT):
-1.  Input Tokens
-2.  Token Embeddings
-3.  Positional Embeddings
+========================
+THE 15 SARAN STEPS
+========================
+1.  Input Tokens (integer IDs)
+2.  Token Embedding Lookup
+3.  Positional Embedding Lookup
 4.  Embedding Summation
 5.  Query Projection
 6.  Key Projection
 7.  Value Projection
-8.  Attention Score Calculation
-9.  Causal Masking
-10. Softmax (Attention Weights)
-11. Attention Output Calculation
-12. MLP Feature Synthesis (GEGLU)
+8.  Scaled Dot-Product Attention Scores
+9.  Causal Masking (autoregressive)
+10. Softmax → Attention Weights
+11. Attention Output (Attn × V)
+12. MLP Feature Synthesis (minimal, single)
 13. Last Token Selection
-14. Output Projection (Weight Tied)
-15. Softmax (Loss)
+14. Output Projection (+ bias)
+15. Softmax (used implicitly by cross-entropy)
+
+NO recurrence
+NO deep stacking
+NO multi-head attention
 """
 
 import math
@@ -33,26 +39,31 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 from datasets import load_dataset
 from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 from tqdm.auto import trange
 
-# ---------------------- CONFIG ---------------------------------
+
+# ---------------- CONFIG ------------------------------------------------------
 MAX_TOKENS = 10_000_000
-BLOCK_SIZE = 256
+BLOCK_SIZE = 1024
 D_MODEL = 768
 BATCH_SIZE = 32
 GRAD_ACCUM_STEPS = 4
-EPOCHS = 10000
-LR = 1.5e-4
+EPOCHS = 10_000
+LR = 3e-4
+RESIDUAL_SCALE = 0.2
 VAL_SPLIT = 0.05
 SEED = 42
 
 DATA_IDS = "data_ids.pt"
 TOKENIZER_DIR = "chat_saran_tokenizer"
-BEST_CKPT = "chat_saran_mlp_v2.best.pt"
-FINAL_CKPT = "chat_saran_mlp_v2.pt"
+BEST_CKPT = "chat_saran_mlp.best.pt"
+FINAL_CKPT = "chat_saran_mlp.pt"
 
+
+# ---------------- DEVICE ------------------------------------------------------
 DEVICE = torch.device(
     "cuda" if torch.cuda.is_available()
     else "mps" if torch.backends.mps.is_available()
@@ -60,40 +71,57 @@ DEVICE = torch.device(
 )
 print("Device:", DEVICE)
 
-# ---------------------- SEED -----------------------------------
+
+# ---------------- SEEDING -----------------------------------------------------
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
 
-# ---------------------- DATA -----------------------------------
+
+# ---------------- DATA --------------------------------------------------------
 rebuild = not os.path.isfile(DATA_IDS)
 
 if rebuild:
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
+    tokenizer.model_max_length = 10**9
     tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
+    os.makedirs(TOKENIZER_DIR, exist_ok=True)
     tokenizer.save_pretrained(TOKENIZER_DIR)
 
     ids = []
     eos = tokenizer.eos_token_id
 
-    sources = [("openwebtext", "train"), ("wikitext", "wikitext-103-raw-v1")]
+    sources = [
+        ("openwebtext", None, "train"),
+        ("wikitext", "wikitext-103-raw-v1", "train"),
+    ]
 
-    for name, split in sources:
-        ds = load_dataset(name, split=split, streaming=True)
+    for name, config, split in sources:
+        if config is None:
+            ds = load_dataset(name, split=split, streaming=True)
+        else:
+            ds = load_dataset(name, config, split=split, streaming=True)
+
         for ex in ds:
             text = ex.get("text", "")[:2000]
             if not text:
                 continue
+
             toks = tokenizer.encode(text, add_special_tokens=False)
             for i in range(0, len(toks), BLOCK_SIZE):
-                ids.extend(toks[i:i+BLOCK_SIZE] + [eos])
+                ids.extend(toks[i:i + BLOCK_SIZE] + [eos])
                 if len(ids) >= MAX_TOKENS:
                     break
             if len(ids) >= MAX_TOKENS:
                 break
+        if len(ids) >= MAX_TOKENS:
+            break
 
     ids = ids[:MAX_TOKENS]
     torch.save(ids, DATA_IDS)
+
 else:
     tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_DIR, local_files_only=True)
     ids = torch.load(DATA_IDS)
@@ -105,20 +133,18 @@ n_train = int(len(data) * (1 - VAL_SPLIT))
 train_data = data[:n_train]
 val_data = data[n_train:]
 
-# ---------------------- MODEL ----------------------------------
-class GEGLU(nn.Module):
-    def forward(self, x):
-        x, gate = x.chunk(2, dim=-1)
-        return x * F.gelu(gate)
 
+# ---------------- MODEL -------------------------------------------------------
 class ChatSARAN_MLP(nn.Module):
     """
-    SARAN + MLP (15 STEPS STRICT)
+    STRICT SARAN + MINIMAL MLP
     """
 
-    def __init__(self, vocab_size, d_model, block_size):
+    def __init__(self, vocab_size, d_model, block_size, residual_scale):
         super().__init__()
+
         self.block_size = block_size
+        self.residual_scale = residual_scale
 
         # (2) Token Embeddings
         self.tok_emb = nn.Embedding(vocab_size, d_model)
@@ -126,35 +152,33 @@ class ChatSARAN_MLP(nn.Module):
         # (3) Positional Embeddings
         self.pos_emb = nn.Embedding(block_size, d_model)
 
-        # (5–7) QKV
+        # (5–7) QKV Projections
         self.Wq = nn.Linear(d_model, d_model, bias=False)
         self.Wk = nn.Linear(d_model, d_model, bias=False)
         self.Wv = nn.Linear(d_model, d_model, bias=False)
 
-        # (12) MLP (GEGLU)
+        # (12) Minimal MLP
         self.mlp = nn.Sequential(
-            nn.Linear(d_model, 8 * d_model),
-            GEGLU(),
+            nn.Linear(d_model, 4 * d_model),
+            nn.GELU(),
             nn.Linear(4 * d_model, d_model),
         )
-        self.mlp_scale = 0.1
 
-        # (8) Attention scale
+        # (8) Scale
         self.register_buffer("scale", torch.tensor(1.0 / math.sqrt(d_model)))
 
-        # (9) Causal mask
+        # (9) Causal Mask
         self.register_buffer(
             "mask", torch.tril(torch.ones(block_size, block_size)).bool()
         )
 
-        # (14) Output projection (weight tied)
-        self.Wout = nn.Linear(d_model, vocab_size, bias=False)
-        self.Wout.weight = self.tok_emb.weight
+        # (14) Output Projection
+        self.Wout = nn.Linear(d_model, vocab_size)
 
     def forward(self, idx, use_last_token=False):
         B, T = idx.shape
 
-        # (1–4) Embed + position
+        # (1–4) Embedding + Position
         tok = self.tok_emb(idx)
         pos = self.pos_emb(torch.arange(T, device=idx.device))
         x = tok + pos
@@ -164,7 +188,7 @@ class ChatSARAN_MLP(nn.Module):
         k = self.Wk(x)
         v = self.Wv(x)
 
-        # (8) Attention scores
+        # (8) Attention Scores
         scores = (q @ k.transpose(-2, -1)) * self.scale
 
         # (9) Mask
@@ -173,64 +197,71 @@ class ChatSARAN_MLP(nn.Module):
         # (10) Softmax
         attn = F.softmax(scores, dim=-1)
 
-        # (11) Attention output
-        x = x + attn @ v
+        # (11) Attention Output
+        attn_out = attn @ v
+        x = x + self.residual_scale * attn_out
 
-        # (12) MLP synthesis
-        x = x + self.mlp_scale * self.mlp(x)
+        # (12) MLP
+        x = x + self.mlp(x)
 
-        # (13) Last token
-        out = x[:, -1, :] if use_last_token else x
+        # (13) Last Token
+        last = x[:, -1, :]
 
-        # (14–15) Projection → softmax (loss outside)
-        return self.Wout(out)
+        # (14) Output Projection
+        return self.Wout(last if use_last_token else x)
 
-# ---------------------- TRAINING --------------------------------
+
+# ---------------- TRAINING ----------------------------------------------------
 def get_batch(data):
     ix = torch.randint(0, len(data) - BLOCK_SIZE - 1, (BATCH_SIZE,))
-    x = torch.stack([data[i:i+BLOCK_SIZE] for i in ix])
-    y = torch.stack([data[i+1:i+BLOCK_SIZE+1] for i in ix])
+    x = torch.stack([data[i:i + BLOCK_SIZE] for i in ix])
+    y = torch.stack([data[i + 1:i + BLOCK_SIZE + 1] for i in ix])
     return x.to(DEVICE), y.to(DEVICE)
 
-model = ChatSARAN_MLP(vocab_size, D_MODEL, BLOCK_SIZE).to(DEVICE)
+
+model = ChatSARAN_MLP(vocab_size, D_MODEL, BLOCK_SIZE, RESIDUAL_SCALE).to(DEVICE)
 optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
 
-num_batches = len(train_data) // (BATCH_SIZE * BLOCK_SIZE)
-total_steps = EPOCHS * num_batches
+steps_per_epoch = len(train_data) // (BATCH_SIZE * BLOCK_SIZE)
+total_steps = EPOCHS * steps_per_epoch
 scheduler = get_linear_schedule_with_warmup(
-    optimizer, int(0.01 * total_steps), total_steps
+    optimizer,
+    int(0.01 * total_steps),
+    total_steps,
 )
 
 best_val = float("inf")
-print("Beginning training...")
 
+print("Beginning training...")
 for ep in range(1, EPOCHS + 1):
     model.train()
     running = 0.0
     optimizer.zero_grad()
 
-    for step in trange(num_batches):
+    for step in trange(steps_per_epoch):
         xb, yb = get_batch(train_data)
         logits = model(xb)
         loss = F.cross_entropy(logits.view(-1, vocab_size), yb.view(-1))
         (loss / GRAD_ACCUM_STEPS).backward()
-        running += loss.item()
 
-        if step % GRAD_ACCUM_STEPS == 0:
+        if (step + 1) % GRAD_ACCUM_STEPS == 0:
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
 
-    train_loss = running / num_batches
+        running += loss.item()
+
+    avg_train = running / steps_per_epoch
 
     model.eval()
     with torch.no_grad():
         xb, yb = get_batch(val_data)
         val_loss = F.cross_entropy(
-            model(xb).view(-1, vocab_size), yb.view(-1)
+            model(xb).view(-1, vocab_size),
+            yb.view(-1)
         ).item()
 
-    print(f"Epoch {ep}: TrainLoss={train_loss:.4f} ValLoss={val_loss:.4f}")
+    print(f"Epoch {ep}: TrainLoss={avg_train:.4f} ValLoss={val_loss:.4f}")
 
     if val_loss < best_val:
         best_val = val_loss

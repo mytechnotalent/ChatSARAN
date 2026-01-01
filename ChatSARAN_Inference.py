@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-ChatSARAN_MLP_Inference_v2.py
+ChatSARAN_Inference.py
+=====================
 
-STRICT SARAN Inference (15 Steps)
-================================
+STRICT SARAN + MLP INFERENCE
 
-Uses the trained SARAN+MLP model exactly as trained.
+Uses the same 15-step architecture as training.
 """
 
 import math
@@ -14,14 +14,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoTokenizer
 
+
 BLOCK_SIZE = 256
 D_MODEL = 768
 TEMPERATURE = 0.7
 TOP_K = 50
 MAX_NEW_TOKENS = 200
 
-MODEL_CKPT = "chat_saran_mlp_v2.best.pt"
 TOKENIZER_DIR = "chat_saran_tokenizer"
+CKPT = "chat_saran_mlp.best.pt"
+
 
 DEVICE = torch.device(
     "cuda" if torch.cuda.is_available()
@@ -30,19 +32,16 @@ DEVICE = torch.device(
 )
 print("Device:", DEVICE)
 
-# ---------------------- MODEL ----------------------------------
-class GEGLU(nn.Module):
-    def forward(self, x):
-        x, gate = x.chunk(2, dim=-1)
-        return x * F.gelu(gate)
 
+# ---------------- MODEL -------------------------------------------------------
 class ChatSARAN_MLP(nn.Module):
     """
-    SARAN + MLP (15 STEP INFERENCE FLOW)
+    SAME 15 STEPS AS TRAINING
     """
 
     def __init__(self, vocab_size, d_model, block_size):
         super().__init__()
+
         self.block_size = block_size
 
         self.tok_emb = nn.Embedding(vocab_size, d_model)
@@ -53,19 +52,17 @@ class ChatSARAN_MLP(nn.Module):
         self.Wv = nn.Linear(d_model, d_model, bias=False)
 
         self.mlp = nn.Sequential(
-            nn.Linear(d_model, 8 * d_model),
-            GEGLU(),
+            nn.Linear(d_model, 4 * d_model),
+            nn.GELU(),
             nn.Linear(4 * d_model, d_model),
         )
-        self.mlp_scale = 0.1
 
         self.register_buffer("scale", torch.tensor(1.0 / math.sqrt(d_model)))
         self.register_buffer(
             "mask", torch.tril(torch.ones(block_size, block_size)).bool()
         )
 
-        self.Wout = nn.Linear(d_model, vocab_size, bias=False)
-        self.Wout.weight = self.tok_emb.weight
+        self.Wout = nn.Linear(d_model, vocab_size)
 
     def forward(self, idx):
         B, T = idx.shape
@@ -83,13 +80,13 @@ class ChatSARAN_MLP(nn.Module):
         attn = F.softmax(scores, dim=-1)
 
         x = x + attn @ v
-        x = x + self.mlp_scale * self.mlp(x)
+        x = x + self.mlp(x)
 
         return self.Wout(x[:, -1, :])
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens):
-        for _ in range(max_new_tokens):
+    def generate(self, idx):
+        for _ in range(MAX_NEW_TOKENS):
             logits = self(idx[:, -self.block_size:])
             logits /= TEMPERATURE
 
@@ -98,18 +95,20 @@ class ChatSARAN_MLP(nn.Module):
                 logits[logits < v[:, [-1]]] = -1e10
 
             probs = F.softmax(logits, dim=-1)
-            next_token = torch.multinomial(probs, 1)
-            idx = torch.cat([idx, next_token], dim=1)
+            nxt = torch.multinomial(probs, 1)
+            idx = torch.cat([idx, nxt], dim=1)
+
         return idx
 
-# ---------------------- LOAD -----------------------------------
+
+# ---------------- RUN ---------------------------------------------------------
 tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_DIR)
 model = ChatSARAN_MLP(tokenizer.vocab_size, D_MODEL, BLOCK_SIZE).to(DEVICE)
-model.load_state_dict(torch.load(MODEL_CKPT, map_location=DEVICE))
+model.load_state_dict(torch.load(CKPT, map_location=DEVICE))
 model.eval()
 
-# ---------------------- RUN ------------------------------------
 prompt = "Hello, how are you?"
-ids = tokenizer.encode(prompt, return_tensors="pt").to(DEVICE)
-out = model.generate(ids, MAX_NEW_TOKENS)
+idx = tokenizer.encode(prompt, return_tensors="pt").to(DEVICE)
+
+out = model.generate(idx)
 print(tokenizer.decode(out[0], skip_special_tokens=True))
