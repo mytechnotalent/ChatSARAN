@@ -47,7 +47,7 @@ from tqdm.auto import trange
 
 # ---------------- CONFIG ------------------------------------------------------
 MAX_TOKENS = 10_000_000
-BLOCK_SIZE = 1024
+BLOCK_SIZE = 768
 D_MODEL = 768
 BATCH_SIZE = 32
 GRAD_ACCUM_STEPS = 4
